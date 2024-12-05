@@ -1,15 +1,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
-	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
+	cmmetav1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
+
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
+	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 )
 
 var GroupName = os.Getenv("GROUP_NAME")
@@ -40,7 +51,9 @@ type customDNSProviderSolver struct {
 	// 3. uncomment the relevant code in the Initialize method below
 	// 4. ensure your webhook's service account has the required RBAC role
 	//    assigned to it for interacting with the Kubernetes APIs you need.
-	//client kubernetes.Clientset
+	client *kubernetes.Clientset
+	ctx    context.Context
+	dnspod map[string]*dnspod.Client
 }
 
 // customDNSProviderConfig is a structure that is used to decode into when
@@ -64,7 +77,8 @@ type customDNSProviderConfig struct {
 	// `issuer.spec.acme.dns01.providers.webhook.config` field.
 
 	//Email           string `json:"email"`
-	//APIKeySecretRef v1alpha1.SecretKeySelector `json:"apiKeySecretRef"`
+	SecretIdRef  cmmetav1.SecretKeySelector `json:"secretIdRef"`
+	SecretKeyRef cmmetav1.SecretKeySelector `json:"secretKeyRef"`
 }
 
 // Name is used as the name for this DNS solver when referencing it on the ACME
@@ -74,7 +88,121 @@ type customDNSProviderConfig struct {
 // within a single webhook deployment**.
 // For example, `cloudflare` may be used as the name of a solver.
 func (c *customDNSProviderSolver) Name() string {
-	return "my-custom-solver"
+	return "dnspod"
+}
+
+func (c *customDNSProviderSolver) getDnspodClient(
+	ch *v1alpha1.ChallengeRequest,
+	cfgJSON *apiextv1.JSON,
+) (*dnspod.Client, error) {
+	cfg, err := loadConfig(cfgJSON)
+	if err != nil {
+		return nil, fmt.Errorf("getDnspodClient fail: %w", err)
+	}
+
+	secretId, err := loadSecretData(c.ctx, c.client, ch.ResourceNamespace, cfg.SecretIdRef)
+	if err != nil {
+		return nil, err
+	}
+
+	dnspodClient, ok := c.dnspod[secretId]
+	if ok {
+		return dnspodClient, nil
+	}
+
+	secretKey, err := loadSecretData(c.ctx, c.client, ch.ResourceNamespace, cfg.SecretKeyRef)
+	if err != nil {
+		return nil, err
+	}
+
+	credential := common.NewCredential(secretId, secretKey)
+	dnspodClient, err = dnspod.NewClient(credential, "", profile.NewClientProfile())
+	if err != nil {
+		return nil, fmt.Errorf("create dnspod client fail: %w", err)
+	}
+	fmt.Println("create dnspod client successfully")
+	c.dnspod[secretId] = dnspodClient
+
+	return dnspodClient, nil
+}
+
+func loadSecretData(
+	ctx context.Context,
+	client *kubernetes.Clientset,
+	namespace string,
+	secretKeyRef cmmetav1.SecretKeySelector,
+) (string, error) {
+	secret, err := client.CoreV1().Secrets(namespace).Get(ctx, secretKeyRef.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("loadSecretData %v fail: %w", secretKeyRef, err)
+	}
+
+	v, ok := secret.Data[secretKeyRef.Key]
+	if !ok {
+		return "", fmt.Errorf("don't find SecretData namespace=%v secretKeyRef=%v", namespace, secretKeyRef)
+	}
+
+	return string(v), nil
+}
+
+func extractSubDomain(fqdn, zone string) string {
+	if idx := strings.Index(fqdn, "."+zone); idx != -1 {
+		return fqdn[:idx]
+	}
+
+	return util.UnFqdn(fqdn)
+}
+
+func findRecord(dnspodClient *dnspod.Client, domain, subDomain, recordType, value string) (*dnspod.RecordListItem, error) {
+	req := dnspod.NewDescribeRecordListRequest()
+	req.Domain = &domain
+	req.Subdomain = &subDomain
+	req.RecordType = &recordType
+
+	resp, err := dnspodClient.DescribeRecordList(req)
+	if err != nil {
+		if err, ok := err.(*errors.TencentCloudSDKError); ok {
+			if err.Code == "ResourceNotFound.NoDataOfRecord" {
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("find text record fail: %w", err)
+	}
+
+	for _, record := range resp.Response.RecordList {
+		if *record.Value == value {
+			return record, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func createTXTRecord(dnspodClient *dnspod.Client, domain, subDomain, value string) error {
+	req := dnspod.NewCreateRecordRequest()
+	req.Domain = &domain
+	req.SubDomain = &subDomain
+	req.Value = &value
+	req.RecordType = common.StringPtr("TXT")
+	req.RecordLine = common.StringPtr("默认")
+
+	_, err := dnspodClient.CreateRecord(req)
+	if err == nil {
+		fmt.Printf("created TXT record %v.%v: %v\n", subDomain, domain, value)
+	}
+	return err
+}
+
+func deleteRecord(dnspodClient *dnspod.Client, domain string, recordId uint64) error {
+	req := dnspod.NewDeleteRecordRequest()
+	req.Domain = &domain
+	req.RecordId = &recordId
+
+	_, err := dnspodClient.DeleteRecord(req)
+	if err == nil {
+		fmt.Printf("deleted TXT record domain=%v recordId=%v\n", domain, recordId)
+	}
+	return err
 }
 
 // Present is responsible for actually presenting the DNS record with the
@@ -83,15 +211,27 @@ func (c *customDNSProviderSolver) Name() string {
 // cert-manager itself will later perform a self check to ensure that the
 // solver has correctly configured the DNS provider.
 func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
-	cfg, err := loadConfig(ch.Config)
+	dnspodClient, err := c.getDnspodClient(ch, ch.Config)
 	if err != nil {
-		return err
+		return fmt.Errorf("get dnspod client fail: %w", err)
 	}
 
-	// TODO: do something more useful with the decoded configuration
-	fmt.Printf("Decoded configuration %v", cfg)
+	subDomain := extractSubDomain(ch.ResolvedFQDN, ch.ResolvedZone)
 
-	// TODO: add code that sets a record in the DNS provider's console
+	record, err := findRecord(dnspodClient, ch.DNSName, subDomain, "TXT", ch.Key)
+	if err != nil {
+		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", ch.DNSName, subDomain, err)
+	}
+
+	if record != nil {
+		return nil
+	}
+
+	err = createTXTRecord(dnspodClient, ch.DNSName, subDomain, ch.Key)
+	if err != nil {
+		return fmt.Errorf("create TXT record fail: %w", err)
+	}
+
 	return nil
 }
 
@@ -102,7 +242,24 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // This is in order to facilitate multiple DNS validations for the same domain
 // concurrently.
 func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	// TODO: add code that deletes a record from the DNS provider's console
+	dnspodClient, err := c.getDnspodClient(ch, ch.Config)
+	if err != nil {
+		return fmt.Errorf("get dnspod client fail: %w", err)
+	}
+
+	subDomain := extractSubDomain(ch.ResolvedFQDN, ch.ResolvedZone)
+	record, err := findRecord(dnspodClient, ch.DNSName, subDomain, "TXT", ch.Key)
+	if err != nil {
+		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", ch.DNSName, subDomain, err)
+	}
+
+	if record != nil {
+		err := deleteRecord(dnspodClient, ch.DNSName, *record.RecordId)
+		if err != nil {
+			return fmt.Errorf("delete record fail domain=%s subDomain=%d: %w", ch.DNSName, *record.RecordId, err)
+		}
+	}
+
 	return nil
 }
 
@@ -116,23 +273,21 @@ func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 // The stopCh can be used to handle early termination of the webhook, in cases
 // where a SIGTERM or similar signal is sent to the webhook process.
 func (c *customDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
-	///// UNCOMMENT THE BELOW CODE TO MAKE A KUBERNETES CLIENTSET AVAILABLE TO
-	///// YOUR CUSTOM DNS PROVIDER
+	cl, err := kubernetes.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return err
+	}
+	c.client = cl
 
-	//cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//c.client = cl
+	c.ctx = context.Background()
+	c.dnspod = make(map[string]*dnspod.Client)
 
-	///// END OF CODE TO MAKE KUBERNETES CLIENTSET AVAILABLE
 	return nil
 }
 
 // loadConfig is a small helper function that decodes JSON configuration into
 // the typed config struct.
-func loadConfig(cfgJSON *extapi.JSON) (customDNSProviderConfig, error) {
+func loadConfig(cfgJSON *apiextv1.JSON) (customDNSProviderConfig, error) {
 	cfg := customDNSProviderConfig{}
 	// handle the 'base case' where no configuration has been provided
 	if cfgJSON == nil {

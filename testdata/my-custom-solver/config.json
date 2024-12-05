@@ -1,1 +1,10 @@
-{}
+{
+    "secretIdRef": {
+      "name": "tencentcloud-secret",
+      "key": "secretId"
+    },
+    "secretKeyRef": {
+      "name": "tencentcloud-secret",
+      "key": "secretKey"
+    }
+}
