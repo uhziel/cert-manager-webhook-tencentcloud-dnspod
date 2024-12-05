@@ -145,12 +145,29 @@ func loadSecretData(
 	return string(v), nil
 }
 
-func extractSubDomain(fqdn, zone string) string {
-	if idx := strings.Index(fqdn, "."+zone); idx != -1 {
+func extractSubDomain(fqdn, domain string) string {
+	name := util.UnFqdn(fqdn)
+	if idx := strings.Index(name, "."+domain); idx != -1 {
 		return fqdn[:idx]
 	}
 
-	return util.UnFqdn(fqdn)
+	return name
+}
+
+func getDomain(dnspodClient *dnspod.Client, ch *v1alpha1.ChallengeRequest) (string, error) {
+	req := dnspod.NewDescribeDomainListRequest()
+	resp, err := dnspodClient.DescribeDomainList(req)
+	if err != nil {
+		return "", fmt.Errorf("get domain fail: %w", err)
+	}
+
+	for _, domain := range resp.Response.DomainList {
+		if strings.HasSuffix(ch.DNSName, *domain.Name) {
+			return *domain.Name, nil
+		}
+	}
+
+	return "", fmt.Errorf("get domain fail: not found")
 }
 
 func findRecord(dnspodClient *dnspod.Client, domain, subDomain, recordType, value string) (*dnspod.RecordListItem, error) {
@@ -215,8 +232,13 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	if err != nil {
 		return fmt.Errorf("get dnspod client fail: %w", err)
 	}
+	fmt.Printf("ChallengeRequest: %#v\n", ch)
 
-	subDomain := extractSubDomain(ch.ResolvedFQDN, ch.ResolvedZone)
+	domain, err := getDomain(dnspodClient, ch)
+	if err != nil {
+		return err
+	}
+	subDomain := extractSubDomain(ch.ResolvedFQDN, domain)
 
 	record, err := findRecord(dnspodClient, ch.DNSName, subDomain, "TXT", ch.Key)
 	if err != nil {
@@ -246,8 +268,13 @@ func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	if err != nil {
 		return fmt.Errorf("get dnspod client fail: %w", err)
 	}
+	fmt.Printf("ChallengeRequest: %#v\n", ch)
 
-	subDomain := extractSubDomain(ch.ResolvedFQDN, ch.ResolvedZone)
+	domain, err := getDomain(dnspodClient, ch)
+	if err != nil {
+		return err
+	}
+	subDomain := extractSubDomain(ch.ResolvedFQDN, domain)
 	record, err := findRecord(dnspodClient, ch.DNSName, subDomain, "TXT", ch.Key)
 	if err != nil {
 		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", ch.DNSName, subDomain, err)
