@@ -182,6 +182,9 @@ func findRecord(dnspodClient *dnspod.Client, domain, subDomain, recordType, valu
 			if err.Code == "ResourceNotFound.NoDataOfRecord" {
 				return nil, nil
 			}
+			if err.Code == "InvalidParameterValue.DomainNotExists" {
+				return nil, nil
+			}
 		}
 		return nil, fmt.Errorf("find text record fail: %w", err)
 	}
@@ -240,18 +243,18 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	}
 	subDomain := extractSubDomain(ch.ResolvedFQDN, domain)
 
-	record, err := findRecord(dnspodClient, ch.DNSName, subDomain, "TXT", ch.Key)
+	record, err := findRecord(dnspodClient, domain, subDomain, "TXT", ch.Key)
 	if err != nil {
-		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", ch.DNSName, subDomain, err)
+		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", domain, subDomain, err)
 	}
 
 	if record != nil {
 		return nil
 	}
 
-	err = createTXTRecord(dnspodClient, ch.DNSName, subDomain, ch.Key)
+	err = createTXTRecord(dnspodClient, domain, subDomain, ch.Key)
 	if err != nil {
-		return fmt.Errorf("create TXT record fail: %w", err)
+		return fmt.Errorf("create TXT record fail domain=%s subDomain=%s: %w", domain, subDomain, err)
 	}
 
 	return nil
@@ -275,15 +278,15 @@ func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 	subDomain := extractSubDomain(ch.ResolvedFQDN, domain)
-	record, err := findRecord(dnspodClient, ch.DNSName, subDomain, "TXT", ch.Key)
+	record, err := findRecord(dnspodClient, domain, subDomain, "TXT", ch.Key)
 	if err != nil {
-		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", ch.DNSName, subDomain, err)
+		return fmt.Errorf("find txt record fail domain=%s subDomain=%s: %w", domain, subDomain, err)
 	}
 
 	if record != nil {
-		err := deleteRecord(dnspodClient, ch.DNSName, *record.RecordId)
+		err := deleteRecord(dnspodClient, domain, *record.RecordId)
 		if err != nil {
-			return fmt.Errorf("delete record fail domain=%s subDomain=%d: %w", ch.DNSName, *record.RecordId, err)
+			return fmt.Errorf("delete record fail domain=%s subDomain=%d: %w", domain, *record.RecordId, err)
 		}
 	}
 

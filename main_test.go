@@ -24,7 +24,7 @@ func TestRunsSuite(t *testing.T) {
 		acmetest.SetResolvedZone(zone),
 		acmetest.SetAllowAmbientCredentials(false),
 		acmetest.SetManifestPath("testdata/my-custom-solver"),
-		acmetest.SetDNSServer("119.29.29.29:53"),
+		acmetest.SetDNSServer("f1g1ns1.dnspod.net:53"),
 	)
 	//need to uncomment and  RunConformance delete runBasic and runExtended once https://github.com/cert-manager/cert-manager/pull/4835 is merged
 	//fixture.RunConformance(t)
